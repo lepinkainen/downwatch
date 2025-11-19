@@ -1,0 +1,80 @@
+# Taskfile for downwatch
+# See: https://taskfile.dev/
+version: '3'
+
+vars:
+  BUILD_DIR: build
+  PROJECT_NAME: downwatch
+
+tasks:
+  # Core build task - depends on tests and linting
+  build:
+    desc: Build the project
+    deps: [test, lint]
+    cmds:
+      - task: build-go
+
+  # Linux-specific build
+  build-linux:
+    desc: Build for Linux
+    deps: [test, lint]
+    env:
+      GOOS: linux
+      GOARCH: amd64
+    cmds:
+      - task: build-go
+
+  # CI build without tests/linting (run separately in CI)
+  build-ci:
+    desc: Build for CI/CD (build only)
+    cmds:
+      - task: build-go
+
+  # Test tasks
+  test:
+    desc: Run tests
+    cmds:
+      - go test ./... # Don't use -v flag to save context
+
+  test-ci:
+    desc: Run tests with coverage for CI
+    cmds:
+      - go test -tags=ci -cover -v ./...
+
+  # Linting tasks
+  lint:
+    desc: Lint code
+    cmds:
+      - goimports -w .
+      - go vet ./...
+      - golangci-lint run
+
+  # Clean build artifacts
+  clean:
+    desc: Clean build artifacts
+    cmds:
+      - rm -rf {{.BUILD_DIR}}
+      - mkdir -p {{.BUILD_DIR}}
+
+  # Go build task
+  build-go:
+    desc: Build Go project
+    cmds:
+      - mkdir -p {{.BUILD_DIR}}
+      - go build -o {{.BUILD_DIR}}/{{.PROJECT_NAME}} .
+
+  # Publish binary to $HOME/bin
+  publish:
+    desc: Install binary to $HOME/bin
+    deps: [build]
+    cmds:
+      - mkdir -p $HOME/bin
+      - cp {{.BUILD_DIR}}/{{.PROJECT_NAME}} $HOME/bin/{{.PROJECT_NAME}}
+      - chmod +x $HOME/bin/{{.PROJECT_NAME}}
+      - echo "Published {{.PROJECT_NAME}} to $HOME/bin/{{.PROJECT_NAME}}"
+
+  # Development task
+  dev:
+    desc: Run downwatch in development mode
+    cmds:
+      - go run . config.yaml

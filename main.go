@@ -10,8 +10,11 @@ import (
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -19,15 +22,19 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// Track files currently being processed to avoid duplicate handling
+var processing sync.Map
+
 type Rule struct {
-	Name         string   `yaml:"name"`
-	Patterns     []string `yaml:"patterns"`      // filepath.Match globs, matched against base filename
-	Extensions   []string `yaml:"extensions"`    // like ["pdf","zip","jpg"], case-insensitive, no leading dot
-	MIMEPrefixes []string `yaml:"mime_prefixes"` // e.g. ["image/","video/","application/pdf"]
-	Action       string   `yaml:"action"`        // "move" (default) or "copy"
-	Dest         string   `yaml:"dest"`          // destination directory (supports ~ expansion); for iCloud Drive, see notes below
-	WebDAVUpload bool     `yaml:"webdav_upload"` // if true, also upload to DAV
-	WebDAVPath   string   `yaml:"webdav_path"`   // remote path prefix (e.g. "/inbox/") for DAV upload
+	Name           string   `yaml:"name"`
+	Patterns       []string `yaml:"patterns"`        // filepath.Match globs, matched against base filename
+	Extensions     []string `yaml:"extensions"`      // like ["pdf","zip","jpg"], case-insensitive, no leading dot
+	MIMEPrefixes   []string `yaml:"mime_prefixes"`   // e.g. ["image/","video/","application/pdf"]
+	Action         string   `yaml:"action"`          // "move" (default) or "copy"
+	Dest           string   `yaml:"dest"`            // destination directory (supports ~ expansion); for iCloud Drive, see notes below
+	SkipDuplicates bool     `yaml:"skip_duplicates"` // if true, delete source (move) or skip (copy) when duplicate exists
+	WebDAVUpload   bool     `yaml:"webdav_upload"`   // if true, also upload to DAV
+	WebDAVPath     string   `yaml:"webdav_path"`     // remote path prefix (e.g. "/inbox/") for DAV upload
 }
 
 type WebDAVConfig struct {
@@ -47,6 +54,7 @@ type Config struct {
 	WebDAV         WebDAVConfig `yaml:"webdav"`
 	LogJSON        bool         `yaml:"log_json"`         // future hook; currently plain log
 	CreateDestDirs bool         `yaml:"create_dest_dirs"` // default true
+	Notifications  bool         `yaml:"notifications"`    // show macOS notifications; default true
 }
 
 func expandHome(p string) (string, error) {
@@ -73,6 +81,7 @@ func defaultConfig() Config {
 		SettleMillis:   1500,
 		PollMillis:     250,
 		CreateDestDirs: true,
+		Notifications:  true,
 		WebDAV: WebDAVConfig{
 			TimeoutSec: 30,
 		},
@@ -93,7 +102,7 @@ func detectMIME(path string) string {
 	if err != nil {
 		return ""
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	buf := make([]byte, 512)
 	n, _ := f.Read(buf)
@@ -103,11 +112,34 @@ func detectMIME(path string) string {
 func hasIgnoredExt(path string, ignores []string) bool {
 	ext := strings.ToLower(filepath.Ext(path))
 	for _, ig := range ignores {
-		if ext == strings.ToLower(ig) {
+		if strings.EqualFold(ext, ig) {
 			return true
 		}
 	}
 	return false
+}
+
+// notifyUser sends a macOS native notification using osascript.
+// Only works on macOS; silently fails on other platforms.
+// Runs asynchronously to avoid blocking file processing.
+func notifyUser(title, message string) {
+	if runtime.GOOS != "darwin" {
+		return
+	}
+
+	// Escape quotes in strings for AppleScript
+	title = strings.ReplaceAll(title, `"`, `\"`)
+	message = strings.ReplaceAll(message, `"`, `\"`)
+
+	script := fmt.Sprintf(`display notification %q with title %q`, message, title)
+	cmd := exec.Command("osascript", "-e", script)
+
+	// Run async in goroutine to avoid blocking
+	go func() {
+		if err := cmd.Run(); err != nil {
+			log.Printf("notification failed: %v", err)
+		}
+	}()
 }
 
 func anyPatternMatch(name string, patterns []string) bool {
@@ -129,7 +161,7 @@ func extMatches(name string, exts []string) bool {
 	}
 	ext := strings.TrimPrefix(strings.ToLower(filepath.Ext(name)), ".")
 	for _, e := range exts {
-		if strings.ToLower(e) == ext {
+		if strings.EqualFold(e, ext) {
 			return true
 		}
 	}
@@ -201,10 +233,10 @@ func atomicMove(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	defer sf.Close()
+	defer func() { _ = sf.Close() }()
 
-	if err := ensureDir(filepath.Dir(dst)); err != nil {
-		return err
+	if errDir := ensureDir(filepath.Dir(dst)); errDir != nil {
+		return errDir
 	}
 
 	df, err := os.Create(dst + ".tmp")
@@ -213,21 +245,21 @@ func atomicMove(src, dst string) error {
 	}
 
 	if _, err := io.Copy(df, sf); err != nil {
-		df.Close()
-		os.Remove(df.Name())
+		_ = df.Close()
+		_ = os.Remove(df.Name())
 		return err
 	}
 	if err := df.Sync(); err != nil {
-		df.Close()
-		os.Remove(df.Name())
+		_ = df.Close()
+		_ = os.Remove(df.Name())
 		return err
 	}
 	if err := df.Close(); err != nil {
-		os.Remove(df.Name())
+		_ = os.Remove(df.Name())
 		return err
 	}
 	if err := os.Rename(df.Name(), dst); err != nil {
-		os.Remove(df.Name())
+		_ = os.Remove(df.Name())
 		return err
 	}
 	return os.Remove(src)
@@ -238,10 +270,10 @@ func copyTo(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	defer sf.Close()
+	defer func() { _ = sf.Close() }()
 
-	if err := ensureDir(filepath.Dir(dst)); err != nil {
-		return err
+	if errDir := ensureDir(filepath.Dir(dst)); errDir != nil {
+		return errDir
 	}
 
 	df, err := os.Create(dst)
@@ -249,11 +281,11 @@ func copyTo(src, dst string) error {
 		return err
 	}
 	if _, err := io.Copy(df, sf); err != nil {
-		df.Close()
+		_ = df.Close()
 		return err
 	}
 	if err := df.Sync(); err != nil {
-		df.Close()
+		_ = df.Close()
 		return err
 	}
 	return df.Close()
@@ -315,7 +347,8 @@ func davClient(cfg WebDAVConfig) *gowebdav.Client {
 	c := gowebdav.NewClient(cfg.URL, cfg.Username, cfg.Password)
 	if cfg.SkipTLSVerify {
 		tr := &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // nolint:gosec
+			// #nosec G402 - InsecureSkipVerify is intentional when user configures skip_tls_verify
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		}
 		c.SetTransport(tr)
 	}
@@ -354,8 +387,8 @@ func loadConfig(path string) (Config, error) {
 	cfg := defaultConfig()
 	dec := yaml.NewDecoder(bytes.NewReader(b))
 	dec.KnownFields(true)
-	if err := dec.Decode(&cfg); err != nil {
-		return Config{}, err
+	if errDec := dec.Decode(&cfg); errDec != nil {
+		return Config{}, errDec
 	}
 	// Expand paths
 	wd, err := expandHome(cfg.WatchDir)
@@ -389,6 +422,12 @@ func loadConfig(path string) (Config, error) {
 }
 
 func handleFile(path string, cfg Config, dav *gowebdav.Client, skipStabilityCheck bool) {
+	// Check if this file is already being processed
+	if _, exists := processing.LoadOrStore(path, time.Now()); exists {
+		return // Already being handled by another goroutine
+	}
+	defer processing.Delete(path)
+
 	// Ignore directories and hidden temp files
 	st, err := os.Stat(path)
 	if err != nil || st.IsDir() {
@@ -426,10 +465,20 @@ func handleFile(path string, cfg Config, dav *gowebdav.Client, skipStabilityChec
 		}
 	}
 
-	// For copy action during initial scan, check if file already exists with same name+size
-	if r.Action == "copy" && skipStabilityCheck {
+	// Check for duplicates if skip_duplicates is enabled
+	if r.SkipDuplicates {
 		if fileExistsWithSameSize(path, destDir) {
-			log.Printf("skip (already exists): %s (rule: %s)", filepath.Base(path), r.Name)
+			if r.Action == "move" {
+				// Delete source file when duplicate exists
+				if err := os.Remove(path); err != nil {
+					log.Printf("failed to delete duplicate source: %v", err)
+					return
+				}
+				log.Printf("deleted (duplicate): %s (rule: %s)", filepath.Base(path), r.Name)
+			} else {
+				// Skip for copy action
+				log.Printf("skip (already exists): %s (rule: %s)", filepath.Base(path), r.Name)
+			}
 			return
 		}
 	}
@@ -446,12 +495,18 @@ func handleFile(path string, cfg Config, dav *gowebdav.Client, skipStabilityChec
 			return
 		}
 		log.Printf("moved: %s -> %s (rule: %s)", filepath.Base(path), destDir, r.Name)
+		if cfg.Notifications {
+			notifyUser("downwatch", fmt.Sprintf("Moved %s to %s", filepath.Base(path), destDir))
+		}
 	case "copy":
 		if err := copyTo(path, dst); err != nil {
 			log.Printf("copy failed: %v", err)
 			return
 		}
 		log.Printf("copied: %s -> %s (rule: %s)", filepath.Base(path), destDir, r.Name)
+		if cfg.Notifications {
+			notifyUser("downwatch", fmt.Sprintf("Copied %s to %s", filepath.Base(path), destDir))
+		}
 	default:
 		// unreachable due to validation
 	}
@@ -482,7 +537,7 @@ func main() {
 	}
 
 	watch := cfg.WatchDir
-	if fi, err := os.Stat(watch); err != nil || !fi.IsDir() {
+	if fi, errStat := os.Stat(watch); errStat != nil || !fi.IsDir() {
 		log.Fatalf("watch_dir is not a directory: %s", watch)
 	}
 
@@ -505,7 +560,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer watcher.Close()
+	defer func() { _ = watcher.Close() }()
 
 	if err := watcher.Add(watch); err != nil {
 		log.Fatal(err)

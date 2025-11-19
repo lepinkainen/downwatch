@@ -27,9 +27,20 @@ go.work.sum
 # env file
 .env
 
+# Build artifacts
+build/
+dist/
+
+# Coverage reports
+coverage.html
+
 # Editor/IDE
-# .idea/
-# .vscode/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
 
 # local stuffs
 config.yaml
